@@ -4,7 +4,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/marcostolosa/infoHaze)](https://goreportcard.com/report/github.com/marcostolosa/infoHaze)
 
 ## Visão Geral
-InfoHaze é um infostealer escrito em Go e mantido apenas para fins educacionais. O projeto demonstra técnicas modernas de coleta e exfiltração de dados em 2025, incluindo derivação de chave baseada em hardware, ofuscação polimórfica e persistência multiplataforma.
+InfoHaze é um infostealer escrito em Go e mantido apenas para fins educacionais. O projeto demonstra técnicas modernas de coleta e exfiltração de dados, incluindo derivação de chave baseada em hardware, ofuscação polimórfica e persistência multiplataforma.
 
 ## Recursos
 - Derivação de chave a partir do hostname e do primeiro MAC disponível.
